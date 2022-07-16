@@ -4,13 +4,14 @@
  * ------------------------------------------------------------------------------------------ */
 'use strict';
 
-import * as fs from "fs"
+import * as fs from "fs";
 import * as path from 'path';
 import * as net from 'net';
 import * as child_process from "child_process";
+import * as glob from 'glob';
 
-import { workspace, Disposable, ExtensionContext } from 'vscode';
-import { LanguageClient, LanguageClientOptions, SettingMonitor, StreamInfo } from 'vscode-languageclient';
+import { workspace, Disposable, ExtensionContext, window } from 'vscode';
+import { LanguageClient, LanguageClientOptions, SettingMonitor, StreamInfo } from 'vscode-languageclient/node';
 
 export function activate(context: ExtensionContext) {
 
@@ -30,32 +31,37 @@ export function activate(context: ExtensionContext) {
 				throw err;
 			});
 
-			let javaExecutablePath = findJavaExecutable('java');
+			const javaExecutablePath = findJavaExecutable();
+			findJar(context).then(jarFile => {
+				// grab a random port.
+				server.listen(() => {
+					// Start the child java process
+					let options = { cwd: workspace.rootPath };
 
-			// grab a random port.
-			server.listen(() => {
-				// Start the child java process
-				let options = { cwd: workspace.rootPath };
+					let args : string[] = [
+						'-jar', jarFile, "--client", (server.address() as net.AddressInfo).port.toString()
+					];
 
-				let args = [
-					'-jar',
-					path.resolve(context.extensionPath, '..', 'server', 'build', 'libs', 'language-server-example-all.jar'),
-					server.address().port.toString()
-				]
+					console.log("Starting OpenJML: " + javaExecutablePath + " " + args);
 
-				let process = child_process.spawn(javaExecutablePath, args, options);
+					let process = child_process.spawn(javaExecutablePath, args, options);
 
-				// Send raw output to a file
-				if (!fs.existsSync(context.storagePath))
-					fs.mkdirSync(context.storagePath);
+					// Send raw output to a file
+					const storagePath = context.storageUri?.fsPath;
+					if (storagePath && !fs.existsSync(storagePath)) {
+						fs.mkdirSync(context.storageUri?.fsPath);
+					}
 
-				let logFile = context.storagePath + '/vscode-languageserver-java-example.log';
-				let logStream = fs.createWriteStream(logFile, { flags: 'w' });
+					let logFile = context.storagePath + '/vscode-languageserver-java-example.log';
+					let logStream = fs.createWriteStream(logFile, { flags: 'w' });
 
-				process.stdout.pipe(logStream);
-				process.stderr.pipe(logStream);
+					if (process) {
+						process.stdout.pipe(logStream);
+						process.stderr.pipe(logStream);
+					}
 
-				console.log(`Storing log in '${logFile}'`);
+					console.log(`Storing log in '${logFile}'`);
+				});
 			});
 		});
 	};
@@ -63,26 +69,33 @@ export function activate(context: ExtensionContext) {
 	// Options to control the language client
 	let clientOptions: LanguageClientOptions = {
 		// Register the server for plain text documents
-		documentSelector: ['plaintext'],
+		documentSelector: ['java'],
 		synchronize: {
 			// Synchronize the setting section 'languageServerExample' to the server
-			configurationSection: 'languageServerExample',
+			configurationSection: 'openjml',
 			// Notify the server about file changes to '.clientrc files contain in the workspace
-			fileEvents: workspace.createFileSystemWatcher('**/.clientrc')
+			fileEvents: workspace.createFileSystemWatcher('**/*.{java,jml}')
 		}
-	}
+	};
 
 	// Create the language client and start the client.
-	let disposable = new LanguageClient('languageServerExample', 'Language Server Example', createServer, clientOptions).start();
+	let client = new LanguageClient('openjml', 'OpenJML support', createServer, clientOptions);
+	let disposable = client.start();
 
 	// Push the disposable to the context's subscriptions so that the 
 	// client can be deactivated on extension deactivation
-	context.subscriptions.push(disposable);
+	context.subscriptions.push(client);
 }
 
 // MIT Licensed code from: https://github.com/georgewfraser/vscode-javac
-function findJavaExecutable(binname: string) {
-	binname = correctBinname(binname);
+function findJavaExecutable(): string {
+	let binname = correctBinname("java");
+
+	let config = workspace.getConfiguration('openjml');
+	let userDefined = path.resolve(config.get("javaPath") || "java");
+	if (fs.existsSync(userDefined)) {
+		return userDefined;
+	}
 
 	// First search each JAVA_HOME bin folder
 	if (process.env['JAVA_HOME']) {
@@ -107,12 +120,48 @@ function findJavaExecutable(binname: string) {
 	}
 
 	// Else return the binary name directly (this will likely always fail downstream) 
-	return null;
+	return "java";
+}
+
+async function findJar(context: ExtensionContext): Promise<string> {
+	let config = workspace.getConfiguration('openjml');
+	let userDefined = path.resolve(config.get("jarFile") || "openjml-lsp-1.0-all.jar");
+
+	if (fs.existsSync(userDefined)) {
+		return userDefined;
+	}
+
+	const localDevMode =
+		path.resolve(context.extensionPath,
+			'..', 'server', 'build', 'libs', 'openjml-lsp-1.0-SNAPSHOT-all.jar');
+
+	if (fs.existsSync(localDevMode)) {
+		return localDevMode;
+	}
+
+	const globallyInstalled =
+		path.resolve("${env.HOME}", ".openjml-lsp", "openjml-lsp-1.0-SNAPSHOT-all.jar");
+
+	if (fs.existsSync(globallyInstalled)) {
+		return localDevMode;
+	}
+
+	const locallyInstalled = await workspace.findFiles("**/openjml-lsp-*-all.jar");
+
+	if (locallyInstalled) {
+		return locallyInstalled[0].fsPath;
+	}
+
+	window.showErrorMessage("Could not find openjml-lsp jar file.");
+
+	return path.resolve("openjml-lsp.jar");
 }
 
 function correctBinname(binname: string) {
-	if (process.platform === 'win32')
+	if (process.platform === 'win32') {
 		return binname + '.exe';
-	else
+	}
+	else {
 		return binname;
+	}
 }
